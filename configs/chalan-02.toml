@@ -9,6 +9,7 @@ model = "anthropic/claude-sonnet-4-20250514"
 
 [memory]
 backend = "postgres"
+auto_save = true
 
 [storage.provider.config]
 provider = "postgres"

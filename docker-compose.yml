@@ -20,9 +20,9 @@ services:
     ports:
       - "8000:8000"
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 3
 
   mailpit:
@@ -38,8 +38,8 @@ services:
   coordinator:
     build:
       context: ../zeroclaw
-      dockerfile: Dockerfile
-      target: dev
+      dockerfile: ../chalanes-control-tower/Dockerfile.zeroclaw
+      target: runtime
     ports:
       - "8080:42617"
     volumes:
@@ -55,8 +55,8 @@ services:
   chalan-01:
     build:
       context: ../zeroclaw
-      dockerfile: Dockerfile
-      target: dev
+      dockerfile: ../chalanes-control-tower/Dockerfile.zeroclaw
+      target: runtime
     ports:
       - "8081:42617"
     volumes:
@@ -74,8 +74,8 @@ services:
   chalan-02:
     build:
       context: ../zeroclaw
-      dockerfile: Dockerfile
-      target: dev
+      dockerfile: ../chalanes-control-tower/Dockerfile.zeroclaw
+      target: runtime
     ports:
       - "8082:42617"
     volumes:

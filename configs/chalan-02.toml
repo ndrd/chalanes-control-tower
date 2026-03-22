@@ -1,0 +1,41 @@
+# Control Tower Worker 2 — routes MX-47, MX-48
+
+workspace_dir = "/zeroclaw-data/workspace"
+persona = "Control Tower Chalan-02. You monitor delivery routes MX-47-GDL-TIJ and MX-48-MTY-MER. Communicate with drivers via WhatsApp and email. Detect anomalies proactively. Escalate critical incidents to the coordinator."
+
+[defaults]
+default_provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+
+[memory]
+backend = "postgres"
+
+[storage.provider.config]
+provider = "postgres"
+db_url = "postgres://postgres:postgres@postgres:5432/postgres"
+schema = "experiment"
+table = "memories"
+
+[gateway]
+port = 42617
+host = "0.0.0.0"
+allow_public_bind = true
+
+[channels.email]
+imap_host = "mailpit"
+imap_port = 1143
+smtp_host = "mailpit"
+smtp_port = 1025
+smtp_tls = false
+username = "chalan02@experiment.test"
+password = "anything"
+from_address = "chalan02@experiment.test"
+allowed_senders = ["*"]
+default_subject = "Chalan-02 Control Tower"
+
+[http_request]
+allow_private_hosts = true
+allowed_domains = ["mock-api", "coordinator"]
+
+[autonomy]
+level = "full"

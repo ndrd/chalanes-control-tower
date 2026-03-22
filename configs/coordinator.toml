@@ -1,0 +1,29 @@
+# Fleet Coordinator — routes tasks, health-checks workers
+
+workspace_dir = "/zeroclaw-data/workspace"
+persona = "Fleet Coordinator for experiment tenant. You manage a team of control-tower chalanes. Route driver messages to the correct chalan, handle escalations, and monitor fleet health."
+
+[defaults]
+default_provider = "openrouter"
+model = "anthropic/claude-sonnet-4-20250514"
+
+[memory]
+backend = "postgres"
+
+[storage.provider.config]
+provider = "postgres"
+db_url = "postgres://postgres:postgres@postgres:5432/postgres"
+schema = "experiment"
+table = "memories"
+
+[gateway]
+port = 42617
+host = "0.0.0.0"
+allow_public_bind = true
+
+[http_request]
+allow_private_hosts = true
+allowed_domains = ["mock-api", "chalan-01", "chalan-02"]
+
+[autonomy]
+level = "full"

@@ -1,0 +1,94 @@
+# docker-compose.yml — Chalanes Control Tower local experiment
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mock-api:
+    build: ./mock-api
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+      - "1143:1143"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "true"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "true"
+
+  coordinator:
+    build:
+      context: ../zeroclaw
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "8080:42617"
+    volumes:
+      - ./configs/coordinator.toml:/zeroclaw-data/.zeroclaw/config.toml:ro
+    environment:
+      API_KEY: "${OPENROUTER_API_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-api:
+        condition: service_healthy
+
+  chalan-01:
+    build:
+      context: ../zeroclaw
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "8081:42617"
+    volumes:
+      - ./configs/chalan-01.toml:/zeroclaw-data/.zeroclaw/config.toml:ro
+    environment:
+      API_KEY: "${OPENROUTER_API_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-api:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+  chalan-02:
+    build:
+      context: ../zeroclaw
+      dockerfile: Dockerfile
+      target: dev
+    ports:
+      - "8082:42617"
+    volumes:
+      - ./configs/chalan-02.toml:/zeroclaw-data/.zeroclaw/config.toml:ro
+    environment:
+      API_KEY: "${OPENROUTER_API_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mock-api:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+
+volumes:
+  pgdata:

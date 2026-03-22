@@ -3,6 +3,7 @@
 **Date**: 2026-03-22
 **Status**: Draft
 **Author**: jndrdlx + Claude
+**Review**: Passed spec review (15 findings addressed)
 
 ## Problem Statement
 
@@ -17,9 +18,9 @@ Chalanes is a multi-tenant SaaS platform that sells fleets of digital employees 
 ### Two-tier model
 
 **Tier 1 — Fleet Coordinator** (1 per tenant):
-- ZeroClaw instance with swarm and delegate tools
-- Routes cross-chalan tasks (reassign routes, aggregate metrics)
-- Health-checks all worker chalanes via cron
+- ZeroClaw instance with `http_request` tool for cross-chalan coordination
+- Routes cross-chalan tasks via Postgres task queue + gateway HTTP calls
+- Health-checks all worker chalanes via cron (polling each chalan's `/health` gateway endpoint)
 - Stores fleet-wide audit log in Postgres
 - Exposes gateway API for future dashboard integration
 
@@ -28,17 +29,34 @@ Chalanes is a multi-tenant SaaS platform that sells fleets of digital employees 
 - Each has its own config (persona, channels, tools, routes)
 - Communicates with drivers via WhatsApp and/or email
 - Monitors shipment tracking API via cron
-- Escalates to fleet coordinator via delegate tool
-- Shares Postgres schema with tenant fleet
+- Escalates to fleet coordinator via `http_request` to coordinator's gateway API
+- Uses SQLite memory locally (per-pod) + shared Postgres for fleet tables
+
+### Inter-chalan communication model
+
+ZeroClaw's `delegate` and `swarm` tools are **intra-process only** — they spawn sub-agents within the same ZeroClaw instance. Cross-pod communication uses two mechanisms:
+
+1. **Postgres task queue** — coordinator writes task rows to a `task_queue` table; workers poll and pick up assigned tasks via cron. This is the primary coordination mechanism (durable, survives restarts).
+2. **Gateway HTTP calls** — for urgent real-time signaling, chalanes use `http_request` to POST to another chalan's gateway `/api/message` endpoint. Requires `allow_private_hosts = true` and k8s service DNS in `allowed_domains`.
+
+The `delegate` and `swarm` tools are still used **within** each chalan for internal multi-step reasoning (e.g., a control-tower chalan using delegate to run a classification sub-agent locally).
+
+### Build requirements
+
+All ZeroClaw container images **must** be built with `--features memory-postgres` to enable the Postgres memory backend. The standard ZeroClaw binary does not include this by default. The Dockerfile must specify:
+
+```dockerfile
+RUN cargo build --release --features memory-postgres
+```
 
 ### Why this architecture
 
 - Worker chalanes are stateless processes + Postgres = easy horizontal scaling
 - One pod dies, one chalan goes down, k8s restarts it in seconds
-- Fleet coordinator handles cross-cutting concerns without inter-pod networking between workers
+- Fleet coordinator handles cross-cutting concerns via task queue (no direct inter-pod RPC needed)
 - Small tenants (5-50 chalanes) pack dense on 1-2 nodes
 - Enterprise tenants (500-5,000) scale horizontally, coordinator can be HA
-- Tenant isolation at k8s namespace level + Postgres schema level
+- Tenant isolation at k8s namespace level + Postgres schema level + Postgres role-per-tenant
 
 ## Chalan Archetypes
 
@@ -48,15 +66,29 @@ An archetype is a reusable role template: persona + tools + channels + behavior.
 
 | Archetype | Channels | Key Tools | Proactive Behavior | Escalates To |
 |-----------|----------|-----------|-------------------|-------------|
-| **fleet-coordinator** | Gateway API only | swarm, delegate, memory, http_request | Cron health-checks all chalanes, aggregates metrics | Human ops (Slack/email) |
-| **control-tower** | WhatsApp, Email | http_request (tracking API), memory, delegate | Cron polls tracking API for anomalies, contacts drivers | fleet-coordinator |
-| **delivery-analyst** | Email only | http_request (tracking + BI API), memory, delegate | Cron generates daily/weekly delivery performance reports | fleet-coordinator |
-| **payments-analyst** | Email only | http_request (payments API, ERP), memory, delegate | Cron flags overdue invoices, reconciliation mismatches | fleet-coordinator |
-| **customer-support** | WhatsApp, Email | http_request (tracking API), memory, delegate | None (reactive only) | control-tower chalan |
+| **fleet-coordinator** | Gateway API only | memory, http_request | Cron health-checks all chalanes, polls task queue, aggregates metrics | Human ops (Slack/email) |
+| **control-tower** | WhatsApp, Email | http_request (tracking API + coordinator gateway), memory | Cron polls tracking API for anomalies, contacts drivers directly | fleet-coordinator (via task queue) |
+| **delivery-analyst** | Email only | http_request (tracking + BI API), memory | Cron generates daily/weekly delivery performance reports | fleet-coordinator (via task queue) |
+| **payments-analyst** | Email only | http_request (payments API, ERP), memory | Cron flags overdue invoices, reconciliation mismatches | fleet-coordinator (via task queue) |
+| **customer-support** | WhatsApp, Email | http_request (tracking API), memory | None (reactive only) | control-tower chalan (via task queue) |
 
 ### Archetype structure
 
 Each archetype is a TOML template (`archetypes/{name}.toml.tpl`) rendered with tenant-specific variables during provisioning. Templates use Handlebars-style placeholders for: tenant name, provider/model, API keys, channel credentials, tracking API domains, route assignments.
+
+All archetype templates must include:
+
+```toml
+[memory]
+backend = "sqlite"
+
+[http_request]
+allow_private_hosts = true
+allowed_domains = [
+  "{{tracking_api_domain}}",
+  "coordinator.chalanes-{{tenant}}.svc.cluster.local",
+]
+```
 
 ### Adding new archetypes
 
@@ -68,20 +100,33 @@ Three layers, coarse to fine:
 
 ### Layer 1 — Config file (k8s ConfigMap)
 
-Generated from archetype template + tenant variables. Controls: persona, system prompt, identity, channels, provider/model, tool allowlists, autonomy level, security policy, query classification rules, delegate agent configs.
+Generated from archetype template + tenant variables. Controls: persona, system prompt, identity, channels, provider/model, tool allowlists, autonomy level, security policy, query classification rules.
 
 Updated by: modify ConfigMap, rolling restart. ZeroClaw reads config at boot.
 
-### Layer 2 — Memory (Postgres, persistent)
+### Layer 2 — Memory (SQLite per-pod, persistent via PV)
 
-Accumulated knowledge that survives restarts:
+Each chalan runs SQLite memory locally (the default and recommended backend). Accumulated knowledge survives restarts:
 - `core` — long-term facts about drivers, routes, preferences
 - `daily` — session-scoped operational context
 - `conversation` — per-thread context with each driver
 
+SQLite memory is stored in the chalan's workspace directory, mounted as a small PersistentVolume per pod (StatefulSet pattern).
+
 ### Layer 3 — Memory Snapshot (soul backup)
 
-ZeroClaw auto-exports `MEMORY_SNAPSHOT.md` from core memories. If Postgres data is lost, the chalan auto-hydrates from this snapshot on next boot. Stored in PersistentVolume or synced to object storage.
+ZeroClaw auto-exports `MEMORY_SNAPSHOT.md` from core SQLite memories (enabled via `snapshot_enabled = true` and `snapshot_on_hygiene = true` in config). If `brain.db` is lost (pod rescheduled to new node, PV lost), the chalan auto-hydrates from this snapshot on next boot.
+
+The snapshot file lives in the same PV as `brain.db`. For disaster recovery, a sidecar or cron can sync it to object storage.
+
+**Note**: This snapshot mechanism works with SQLite/Lucid backends only. It does not apply to the Postgres memory backend.
+
+### Why SQLite for chalan memory, Postgres for fleet tables
+
+- SQLite gives each chalan zero-latency memory access with no network dependency
+- Chalan survives Postgres outages for memory operations
+- Fleet-wide tables (routes, incidents, audit_log, task_queue) live in Postgres where they need cross-chalan visibility
+- No risk of cross-tenant memory leakage — each pod has its own `brain.db`
 
 ## Tenant Provisioning
 
@@ -93,21 +138,43 @@ Each tenant is defined by a YAML manifest:
 tenant: acme-logistics
 provider: openrouter
 api_key_secret: acme-api-key
+tracking_api_domain: api.acme.com
+
+whatsapp:
+  mode: shared              # shared (one number, coordinator routes) or dedicated (one per chalan)
+  phone_number_id: "123..."
+  access_token_secret: acme-wa-token
+  verify_token: "verify-..."
+
+email:
+  imap_host: imap.acme.com
+  smtp_host: smtp.acme.com
+  credentials_secret: acme-email-creds
 
 chalanes:
   - archetype: fleet-coordinator
     count: 1
+
   - archetype: control-tower
     count: 12
-    assign_to: routes
+    assign_to: routes       # maps to routes table: round-robin or explicit
+    routes:                 # optional explicit mapping
+      - "MX-45-CDMX-GDL"
+      - "MX-46-CDMX-MTY"
+      # ... remaining 10 auto-assigned from unassigned routes
     channels:
       whatsapp: true
       email: true
+
   - archetype: delivery-analyst
     count: 2
     assign_to: regions
+    regions:
+      - "north"
+      - "south"
     channels:
       email: true
+
   - archetype: payments-analyst
     count: 1
     channels:
@@ -119,38 +186,62 @@ chalanes:
           - erp.acme.com
 ```
 
+### WhatsApp number strategy
+
+Two modes:
+
+- **Shared** (default, recommended for cost): One WhatsApp Business number per tenant. All inbound messages hit the coordinator's gateway webhook. Coordinator looks up driver phone → assigned chalan in `routes` table, forwards to the correct chalan via task queue. Outbound messages from any chalan go through the shared number (each chalan has the access token).
+- **Dedicated**: One WhatsApp number per chalan (expensive — requires N Business numbers). Each chalan receives its own webhooks directly. Only viable for enterprise tenants with Meta Business Manager approval for multiple numbers.
+
 ### Provisioning steps (`provision-tenant.sh`)
 
 1. Create k8s namespace `chalanes-{tenant}`
-2. Create Postgres schema `{tenant}` with standard tables
-3. Create k8s Secret from tenant credentials
-4. Render archetype templates into ConfigMaps (one per chalan)
-5. Auto-generate coordinator config with swarm/delegate entries for all worker chalanes
+2. Create Postgres role `chalanes_{tenant}` with `USAGE` and `CREATE` on schema `{tenant}` only (no cross-schema access)
+3. Create Postgres schema `{tenant}` owned by the tenant role, with standard tables
+4. Create k8s Secret from tenant credentials (API keys, WhatsApp token, email creds, Postgres role password)
+5. Render archetype templates into ConfigMaps (one per chalan), injecting:
+   - Tenant schema name, Postgres connection string (with tenant role)
+   - Route/region assignments (from manifest `routes`/`regions` fields or auto-assigned from `routes` table)
+   - k8s service DNS for coordinator endpoint
+   - `allow_private_hosts = true` and `allowed_domains` including coordinator and mock-api
 6. Helm install into the namespace
-7. Seed initial data (routes, drivers, shipments)
+7. Seed initial data (routes, drivers, shipments) into tenant schema
+
+### Route/region assignment logic
+
+When `assign_to: routes`:
+- If `routes` list is provided in manifest: assign explicitly (chalan-01 → route[0], chalan-02 → route[1], etc.)
+- If `routes` is omitted: query `routes` table for unassigned routes, round-robin assign to chalanes
+- Assignment is recorded in `routes.chalan_id` column
+
+When `assign_to: regions`:
+- The `regions` list maps 1:1 to chalan instances
+- Each region chalan handles all routes in that region (determined by a `region` column in `routes` table)
 
 ### Teardown
 
-`kubectl delete namespace chalanes-{tenant}` + `DROP SCHEMA {tenant} CASCADE`.
+`kubectl delete namespace chalanes-{tenant}` + `DROP SCHEMA {tenant} CASCADE` + `DROP ROLE chalanes_{tenant}`.
 
 ## Data Model (PostgreSQL)
 
-Per-tenant schema with these tables:
+Per-tenant schema with these tables (owned by tenant-specific Postgres role):
 
 ### `chalanes`
-Fleet registry. Fields: id (UUID PK), name, role (worker|coordinator), status, config_hash (drift detection), last_heartbeat, created_at.
+Fleet registry. Fields: id (UUID PK), name, archetype, role (worker|coordinator), status, config_hash (drift detection), last_heartbeat, created_at.
 
 ### `routes`
-Route-to-chalan assignment. Fields: id (UUID PK), chalan_id (FK), route_code, origin, destination, driver_name, driver_phone (WhatsApp E.164), driver_email, status, metadata (JSONB).
+Route-to-chalan assignment. Fields: id (UUID PK), chalan_id (FK), route_code, region, origin, destination, driver_name, driver_phone (WhatsApp E.164), driver_email, status, metadata (JSONB).
 
 ### `incidents`
 The chalan's work product. Fields: id (UUID PK), chalan_id (FK), route_id (FK), type (delay|breakdown|deviation|no_signal|resolved), severity (low|medium|high|critical), summary, source (whatsapp|email|tracker_api|proactive), resolved_at, created_at.
 
+### `task_queue`
+Cross-chalan coordination. Fields: id (UUID PK), from_chalan_id (FK), to_chalan_id (FK, nullable for coordinator), action (TEXT — e.g., "reassign_route", "notify_driver", "escalate"), payload (JSONB), status (pending|claimed|completed|failed), claimed_at, completed_at, created_at.
+
+Workers poll this table via cron (every 30s) for tasks assigned to them. Coordinator polls for escalations.
+
 ### `audit_log`
 Every LLM call, tool use, message sent/received. Fields: id (UUID PK), chalan_id (FK), event_type, detail (JSONB), tokens_used, cost_usd, created_at.
-
-### `memories`
-ZeroClaw memory-postgres backend table. Fields: id (TEXT PK), key, content, category, created_at, updated_at, session_id. Indexed on category and session_id.
 
 ## Message & Incident Flow
 
@@ -158,27 +249,32 @@ ZeroClaw memory-postgres backend table. Fields: id (TEXT PK), key, content, cate
 
 ```
 Driver sends WhatsApp: "Flat tire on highway 45D km 230"
-  → chalan-whatsapp receives via gateway webhook
+  → Gateway webhook receives on shared WhatsApp number
+  → Coordinator looks up driver phone in routes table → assigned to chalan-mx01
+  → Coordinator writes task_queue entry: {to: chalan-mx01, action: "handle_driver_message", payload: {...}}
+  → chalan-mx01 picks up task on next cron poll (≤30s)
   → Classifies: incident, severity=high, type=breakdown
   → Stores to incidents table
-  → Queries tracking API: shipment ETA, cargo type, nearest alternate
-  → Responds to driver: "Acknowledged. Roadside assistance dispatched. ETA 40min."
-  → Delegates to coordinator: "Route MX-45 breakdown, need reassignment"
-    → Coordinator queries routes: find available chalan with capacity
-    → Delegates to chalan-mx03: "Take over shipment #4521"
-    → Notifies ops via chalan-email
-  → Logs full trace to audit_log
+  → Queries tracking API via http_request: shipment ETA, cargo type
+  → Sends WhatsApp reply to driver (outbound via shared number access token)
+  → Writes escalation to task_queue: {to: coordinator, action: "reassign_route", payload: {route: "MX-45", reason: "breakdown"}}
+  → Coordinator picks up escalation, queries routes for available chalan
+  → Coordinator writes task: {to: chalan-mx03, action: "take_over_shipment", payload: {shipment: "#4521"}}
+  → Coordinator writes task: {to: chalan-email, action: "notify_ops", payload: {subject: "Route MX-45 breakdown"}}
+  → All steps logged to audit_log
 ```
 
 ### Proactive (system-initiated)
 
 ```
-Cron fires every 5 minutes on chalan-tracker
-  → Queries tracking API for assigned routes
+Cron fires every 5 minutes on chalan-mx01 (control-tower archetype)
+  → Queries tracking API for assigned routes via http_request
   → Detects: shipment #4580 has no GPS update in 18 minutes
-  → Sends WhatsApp to driver via delegate to chalan-whatsapp: "We noticed your location hasn't updated. Everything OK?"
-  → If no response in 10 minutes: escalate to coordinator
-  → Logs to incidents table (type=no_signal, source=proactive)
+  → Sends WhatsApp to driver directly (has access token): "We noticed your location hasn't updated. Everything OK?"
+  → Stores incident in incidents table (type=no_signal, source=proactive)
+  → If no response in 10 minutes (checked on next cron tick):
+    → Writes escalation to task_queue: {to: coordinator, action: "escalate_no_signal", payload: {...}}
+  → Logs to audit_log
 ```
 
 ## LLM Provider Strategy
@@ -195,24 +291,50 @@ Tenant-decides (BYOK):
 
 | Event | Behavior |
 |-------|----------|
-| Pod restart | Reads config from ConfigMap, reconnects to Postgres. Memory intact. Channels reconnect. Seconds. |
-| Pod killed + rescheduled | Same as restart. Stateless binary + Postgres. |
-| Postgres failure | Chalan continues running, channels still work. Memory ops fail gracefully. Alert to coordinator. |
-| Config update | Update ConfigMap → rolling restart. New persona/tools/routes take effect. Memory persists. |
+| Pod restart | Reads config from ConfigMap, loads SQLite memory from PV. Channels reconnect. Seconds. |
+| Pod killed + rescheduled to new node | PV reattaches (StatefulSet). Memory and brain.db intact. If PV lost, auto-hydrates from MEMORY_SNAPSHOT.md. |
+| Postgres unavailable at startup | Chalan starts successfully (SQLite memory is local). Fleet table operations (incidents, task_queue, audit_log) will fail until Postgres recovers. Channels still work. |
+| Postgres fails mid-session | Channel listeners continue. Fleet table writes (via http_request to mock-api or direct SQL) produce errors surfaced to the LLM. Memory operations unaffected (SQLite). |
+| Config update | Update ConfigMap → rolling restart. New persona/tools/routes take effect. SQLite memory persists on PV. |
 | Scale up | Add entries to fleet manifest, re-run provisioning or Helm upgrade. |
+
+## Security
+
+### Tenant isolation
+
+- **k8s namespace** per tenant — NetworkPolicy restricts cross-namespace traffic
+- **Postgres role** per tenant — role can only access its own schema, no cross-schema queries
+- **k8s Secrets** for all credentials — never in ConfigMaps or config files
+
+### Network security
+
+- **Postgres TLS**: ZeroClaw's Postgres backend currently connects with `NoTls`. For Phase 1 (local experiment), this is acceptable. For production, either:
+  - (a) Deploy a service mesh (Istio/Linkerd) for mTLS on all intra-cluster traffic, or
+  - (b) Contribute TLS support to ZeroClaw's Postgres backend (upstream issue required)
+- **NetworkPolicy**: Required in Helm chart to restrict:
+  - Chalan pods can only reach: Postgres, coordinator, mock-api (within same namespace)
+  - `/health` endpoint accessible only from same namespace + kubelet CIDR
+  - No cross-namespace pod-to-pod traffic
+- **http_request**: `allow_private_hosts = true` scoped to specific `allowed_domains` (coordinator DNS, tracking API). No wildcard.
+
+### Credential rotation
+
+- k8s Secret rotation for API keys and WhatsApp tokens — rolling restart picks up new values
+- Postgres role password rotation — update Secret + restart
 
 ## Observability
 
 Per-chalan:
 - `/health` gateway endpoint — k8s liveness/readiness probes
 - `channel health_check()` — per-channel connectivity
-- `tracing` structured logs — JSON format for k8s log aggregation
+- `tracing` structured logs — JSON format for k8s log aggregation (stdout)
 - Cost tracker — per-model token usage, queryable via gateway API
 
 Fleet-wide (via coordinator):
-- Cron polling each chalan's `/health`
+- Cron polling each chalan's `/health` endpoint via `http_request`
 - Aggregated cost tracking in Postgres audit_log
-- Incident counts, response times, escalation rates per chalan
+- Incident counts, response times, escalation rates per chalan (queryable from incidents table)
+- Task queue depth monitoring (detect stuck/slow chalanes)
 
 ## Local Experiment
 
@@ -221,11 +343,10 @@ Fleet-wide (via coordinator):
 ```
 chalanes-control-tower/
 ├── docker-compose.yml
+├── Dockerfile.zeroclaw           # Builds ZeroClaw with --features memory-postgres
 ├── configs/
 │   ├── coordinator.toml
-│   ├── chalan-whatsapp.toml
-│   ├── chalan-email.toml
-│   └── chalan-tracker.toml
+│   └── chalan-control-tower.toml # Single control-tower chalan for the experiment
 ├── archetypes/
 │   ├── fleet-coordinator.toml.tpl
 │   ├── control-tower.toml.tpl
@@ -243,20 +364,26 @@ chalanes-control-tower/
 │       ├── Chart.yaml
 │       ├── values.yaml
 │       └── templates/
+│           ├── coordinator.yaml
+│           ├── chalan-statefulset.yaml
+│           ├── postgres.yaml
+│           ├── secrets.yaml
+│           └── networkpolicy.yaml
 └── docs/
 ```
 
 ### Docker-compose topology
 
+The local experiment collapses the architecture into fewer containers for simplicity. Instead of separate WhatsApp/email/tracker containers (which can't cross-delegate anyway), each control-tower chalan is a **single container** with WhatsApp + email + cron all configured.
+
 | Container | Role | Port |
 |-----------|------|------|
-| `postgres` | Shared memory + state | 5432 |
+| `postgres` | Fleet tables + shared state | 5432 |
 | `mock-api` | Shipment tracking simulation | 8000 |
-| `mailhog` | Local SMTP/IMAP test server | 1025/1143/8025 |
-| `coordinator` | Fleet brain | 8080 |
-| `chalan-whatsapp` | WhatsApp handler | 8081 |
-| `chalan-email` | Email handler | 8082 |
-| `chalan-tracker` | Proactive route monitor | 8083 |
+| `mailpit` | Local SMTP + IMAP test server (replaces MailHog — supports IMAP IDLE) | 1025 (SMTP) / 1143 (IMAP) / 8025 (Web UI) |
+| `coordinator` | Fleet brain, task queue processor, WhatsApp webhook receiver | 8080 |
+| `chalan-01` | Control-tower worker (WhatsApp outbound + email + cron tracking) | 8081 |
+| `chalan-02` | Control-tower worker (WhatsApp outbound + email + cron tracking) | 8082 |
 
 ### Mock tracking API
 
@@ -274,27 +401,28 @@ FastAPI server with endpoints:
 
 | Test | Method | Success Criteria |
 |------|--------|-----------------|
-| Reactive WhatsApp | POST to chalan-whatsapp gateway simulating driver message | Classifies incident, logs to Postgres, responds |
-| Reactive Email | Send email to MailHog, chalan-email picks it up | Parses, creates incident, replies |
-| Proactive monitoring | Run mock-api simulation, let cron tick | Detects late shipment, sends WhatsApp, logs incident |
-| Escalation | Trigger critical incident | Worker delegates to coordinator, coordinator routes |
-| Memory persistence | Restart chalan pod, send follow-up | Remembers driver and prior context from Postgres |
-| Fleet provisioning | Run provision-tenant.sh with manifest | Fleet comes up, health checks pass |
-| Cost tracking | Run 10 interactions | Audit log shows token usage and cost per chalan |
+| Reactive WhatsApp | POST to coordinator gateway simulating WhatsApp webhook | Coordinator routes to chalan-01 via task_queue, chalan-01 classifies and responds |
+| Reactive Email | Send email to Mailpit, chalan-01 picks it up via IMAP IDLE | Parses, creates incident in Postgres, replies via SMTP |
+| Proactive monitoring | Run `POST /simulate/tick` on mock-api, wait for chalan-01 cron | Detects late shipment, sends WhatsApp, logs incident |
+| Escalation via task queue | Trigger critical incident on chalan-01 | chalan-01 writes to task_queue, coordinator picks up and routes |
+| Memory persistence | Restart chalan-01 container, send follow-up | Remembers driver and prior context from SQLite (PV-backed volume) |
+| Fleet provisioning | Run provision-tenant.sh with manifest | Coordinator + workers come up, all /health checks pass |
+| Cost tracking | Run 10 interactions | audit_log shows token usage and cost per chalan |
 
 ## Out of Scope (Phase 1)
 
-- Real WhatsApp Business API integration (use gateway mock)
-- Real email provider (use MailHog)
+- Real WhatsApp Business API integration (use gateway mock for inbound, direct API for outbound in experiment)
+- Real email provider (use Mailpit)
 - k8s Operator / CRD (use shell script + Helm)
-- A2A protocol between chalanes (use delegate + Postgres)
+- A2A protocol between chalanes (use task queue + http_request)
 - Dashboard / web UI for fleet management
-- End-customer facing support (control-tower only, not customer-support archetype)
+- End-customer facing support (control-tower only)
 - Multi-region deployment
 - SSO / RBAC for tenant management
+- Postgres TLS (use plaintext for local experiment; service mesh or upstream fix for production)
 
 ## Future Phases
 
-- **Phase 2**: Real WhatsApp + email integration, k8s Operator, dashboard
-- **Phase 3**: A2A protocol for inter-chalan communication, customer-support archetype
+- **Phase 2**: Real WhatsApp + email integration, k8s Operator, dashboard, Postgres TLS
+- **Phase 3**: A2A protocol for inter-chalan communication (when ZeroClaw PR #4166 merges), customer-support archetype
 - **Phase 4**: Multi-region, advanced analytics, tenant self-service portal

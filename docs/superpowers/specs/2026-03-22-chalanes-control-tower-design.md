@@ -30,7 +30,7 @@ Chalanes is a multi-tenant SaaS platform that sells fleets of digital employees 
 - Communicates with drivers via WhatsApp and/or email
 - Monitors shipment tracking API via cron
 - Escalates to fleet coordinator via `http_request` to coordinator's gateway API
-- Uses SQLite memory locally (per-pod) + shared Postgres for fleet tables
+- Uses Postgres for both memory and fleet tables (shared per-tenant schema)
 
 ### Inter-chalan communication model
 
@@ -80,7 +80,12 @@ All archetype templates must include:
 
 ```toml
 [memory]
-backend = "sqlite"
+backend = "postgres"
+
+[storage.provider.config]
+provider = "postgres"
+db_url = "{{postgres_url}}"
+schema = "{{tenant_schema}}"
 
 [http_request]
 allow_private_hosts = true
@@ -104,29 +109,23 @@ Generated from archetype template + tenant variables. Controls: persona, system 
 
 Updated by: modify ConfigMap, rolling restart. ZeroClaw reads config at boot.
 
-### Layer 2 — Memory (SQLite per-pod, persistent via PV)
+### Layer 2 — Memory (Postgres, shared and durable)
 
-Each chalan runs SQLite memory locally (the default and recommended backend). Accumulated knowledge survives restarts:
+All chalanes use the Postgres memory backend (`backend = "postgres"`). Accumulated knowledge survives pod restarts, rescheduling, and node failures — the memories live in the database, not in the pod:
 - `core` — long-term facts about drivers, routes, preferences
 - `daily` — session-scoped operational context
 - `conversation` — per-thread context with each driver
 
-SQLite memory is stored in the chalan's workspace directory, mounted as a small PersistentVolume per pod (StatefulSet pattern).
+**No file-based soul backup needed.** ZeroClaw's `MEMORY_SNAPSHOT.md` auto-hydration mechanism exists for the SQLite backend (where `brain.db` is a local file that can be lost). With Postgres, the database itself is the durable store — pod crashes, rescheduling, and scaling events don't affect the data. Postgres replication/backups handle disaster recovery at the infrastructure level.
 
-### Layer 3 — Memory Snapshot (soul backup)
+### Why Postgres for everything
 
-ZeroClaw auto-exports `MEMORY_SNAPSHOT.md` from core SQLite memories (enabled via `snapshot_enabled = true` and `snapshot_on_hygiene = true` in config). If `brain.db` is lost (pod rescheduled to new node, PV lost), the chalan auto-hydrates from this snapshot on next boot.
-
-The snapshot file lives in the same PV as `brain.db`. For disaster recovery, a sidecar or cron can sync it to object storage.
-
-**Note**: This snapshot mechanism works with SQLite/Lucid backends only. It does not apply to the Postgres memory backend.
-
-### Why SQLite for chalan memory, Postgres for fleet tables
-
-- SQLite gives each chalan zero-latency memory access with no network dependency
-- Chalan survives Postgres outages for memory operations
-- Fleet-wide tables (routes, incidents, audit_log, task_queue) live in Postgres where they need cross-chalan visibility
-- No risk of cross-tenant memory leakage — each pod has its own `brain.db`
+- Single storage layer — no PersistentVolumes, no StatefulSets, simpler k8s topology (Deployments instead)
+- Memories are immediately available on any pod (no PV reattach delay)
+- Fleet-wide visibility — coordinator can query any chalan's memories if needed for cross-chalan context
+- Postgres handles backup/replication natively — no custom snapshot mechanism
+- Tenant isolation via schema + role — same model for memory tables and fleet tables
+- Tradeoff: chalan depends on Postgres availability for memory ops (acceptable — fleet tables already require it)
 
 ## Tenant Provisioning
 
@@ -291,11 +290,11 @@ Tenant-decides (BYOK):
 
 | Event | Behavior |
 |-------|----------|
-| Pod restart | Reads config from ConfigMap, loads SQLite memory from PV. Channels reconnect. Seconds. |
-| Pod killed + rescheduled to new node | PV reattaches (StatefulSet). Memory and brain.db intact. If PV lost, auto-hydrates from MEMORY_SNAPSHOT.md. |
-| Postgres unavailable at startup | Chalan starts successfully (SQLite memory is local). Fleet table operations (incidents, task_queue, audit_log) will fail until Postgres recovers. Channels still work. |
-| Postgres fails mid-session | Channel listeners continue. Fleet table writes (via http_request to mock-api or direct SQL) produce errors surfaced to the LLM. Memory operations unaffected (SQLite). |
-| Config update | Update ConfigMap → rolling restart. New persona/tools/routes take effect. SQLite memory persists on PV. |
+| Pod restart | Reads config from ConfigMap, reconnects to Postgres. All memory intact in database. Channels reconnect. Seconds. |
+| Pod killed + rescheduled to new node | No local state to lose — memory is in Postgres. New pod connects and has full context immediately. No PV needed. |
+| Postgres unavailable at startup | Chalan fails to start (Postgres is required for both memory and fleet tables). k8s restarts until Postgres recovers. Configure `connect_timeout_secs` to bound wait time. |
+| Postgres fails mid-session | Channel listeners continue but memory ops and fleet table writes produce errors surfaced to the LLM. Chalan can still receive messages but cannot recall context or log incidents until recovery. |
+| Config update | Update ConfigMap → rolling restart. New persona/tools/routes take effect. Memory persists in Postgres. |
 | Scale up | Add entries to fleet manifest, re-run provisioning or Helm upgrade. |
 
 ## Security
@@ -365,7 +364,7 @@ chalanes-control-tower/
 │       ├── values.yaml
 │       └── templates/
 │           ├── coordinator.yaml
-│           ├── chalan-statefulset.yaml
+│           ├── chalan-deployment.yaml
 │           ├── postgres.yaml
 │           ├── secrets.yaml
 │           └── networkpolicy.yaml
@@ -405,7 +404,7 @@ FastAPI server with endpoints:
 | Reactive Email | Send email to Mailpit, chalan-01 picks it up via IMAP IDLE | Parses, creates incident in Postgres, replies via SMTP |
 | Proactive monitoring | Run `POST /simulate/tick` on mock-api, wait for chalan-01 cron | Detects late shipment, sends WhatsApp, logs incident |
 | Escalation via task queue | Trigger critical incident on chalan-01 | chalan-01 writes to task_queue, coordinator picks up and routes |
-| Memory persistence | Restart chalan-01 container, send follow-up | Remembers driver and prior context from SQLite (PV-backed volume) |
+| Memory persistence | Restart chalan-01 container, send follow-up | Remembers driver and prior context from Postgres |
 | Fleet provisioning | Run provision-tenant.sh with manifest | Coordinator + workers come up, all /health checks pass |
 | Cost tracking | Run 10 interactions | audit_log shows token usage and cost per chalan |
 
@@ -420,9 +419,10 @@ FastAPI server with endpoints:
 - Multi-region deployment
 - SSO / RBAC for tenant management
 - Postgres TLS (use plaintext for local experiment; service mesh or upstream fix for production)
+- XOAUTH2 for Gmail Enterprise (use App Passwords for Phase 1; upstream contribution for OAuth2 IMAP/SMTP auth in Phase 2)
 
 ## Future Phases
 
-- **Phase 2**: Real WhatsApp + email integration, k8s Operator, dashboard, Postgres TLS
+- **Phase 2**: Real WhatsApp + email integration (including XOAUTH2 for Gmail Enterprise), k8s Operator, dashboard, Postgres TLS
 - **Phase 3**: A2A protocol for inter-chalan communication (when ZeroClaw PR #4166 merges), customer-support archetype
 - **Phase 4**: Multi-region, advanced analytics, tenant self-service portal

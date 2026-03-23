@@ -3,9 +3,8 @@
 workspace_dir = "/zeroclaw-data/workspace"
 persona = "Control Tower Chalan-01. You monitor delivery routes MX-45-CDMX-GDL and MX-46-CDMX-MTY. Communicate with drivers via WhatsApp and email. Detect anomalies proactively. Escalate critical incidents to the coordinator."
 
-[defaults]
 default_provider = "openrouter"
-model = "anthropic/claude-sonnet-4-20250514"
+default_model = "anthropic/claude-sonnet-4.6"
 
 [memory]
 backend = "postgres"
@@ -13,7 +12,7 @@ auto_save = true
 
 [storage.provider.config]
 provider = "postgres"
-db_url = "postgres://postgres:postgres@postgres:5432/postgres"
+db_url = "postgresql://postgres.qivyvbdximbrhzultldc:bejnyn-Tuqwew-9tovxy@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 schema = "experiment"
 table = "memories"
 
@@ -21,6 +20,10 @@ table = "memories"
 port = 42617
 host = "0.0.0.0"
 allow_public_bind = true
+
+[channels_config.whatsapp]
+session_path = "/zeroclaw-data/.zeroclaw/whatsapp-session.db"
+allowed_numbers = ["*"]
 
 [channels.email]
 imap_host = "mailpit"

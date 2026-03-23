@@ -1,0 +1,4 @@
+[submodule "zeroclaw"]
+	path = zeroclaw
+	url = https://github.com/ndrd/zeroclaw.git
+	branch = fix/postgres-memory-tokio-native

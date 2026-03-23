@@ -15,7 +15,12 @@ RUN npm run build
 FROM rust:1.94-slim AS builder
 
 WORKDIR /app
-ARG ZEROCLAW_CARGO_FEATURES="memory-postgres"
+ARG ZEROCLAW_CARGO_FEATURES="memory-postgres whatsapp-web"
+# Limit parallel codegen/link jobs to avoid OOM on memory-constrained hosts
+ENV CARGO_BUILD_JOBS=1
+# Override upstream profile: fat LTO + codegen-units=1 requires ~8 GB; use thin LTO instead
+ENV CARGO_PROFILE_RELEASE_LTO=thin
+ENV CARGO_PROFILE_RELEASE_CODEGEN_UNITS=4
 
 RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
     --mount=type=cache,target=/var/lib/apt,sharing=locked \

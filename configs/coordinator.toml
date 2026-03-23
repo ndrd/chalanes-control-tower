@@ -3,9 +3,8 @@
 workspace_dir = "/zeroclaw-data/workspace"
 persona = "Fleet Coordinator for experiment tenant. You manage a team of control-tower chalanes. Route driver messages to the correct chalan, handle escalations, and monitor fleet health."
 
-[defaults]
 default_provider = "openrouter"
-model = "anthropic/claude-sonnet-4-20250514"
+default_model = "anthropic/claude-sonnet-4.6"
 
 [memory]
 backend = "postgres"
@@ -13,7 +12,7 @@ auto_save = true
 
 [storage.provider.config]
 provider = "postgres"
-db_url = "postgres://postgres:postgres@postgres:5432/postgres"
+db_url = "postgresql://postgres.qivyvbdximbrhzultldc:bejnyn-Tuqwew-9tovxy@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
 schema = "experiment"
 table = "memories"
 
